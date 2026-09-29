@@ -1,7 +1,6 @@
 services:
   postiz:
     image: ghcr.io/gitroomhq/postiz-app:latest
-    container_name: postiz
     restart: always
     environment:
       # === Required Settings
@@ -112,8 +111,6 @@ services:
     volumes:
       - postiz-config:/config/
       - postiz-uploads:/uploads/
-    ports:
-      - "4007:5000"
     networks:
       - postiz-network
       - temporal-network
@@ -133,7 +130,6 @@ services:
 
   postiz-postgres:
     image: postgres:17-alpine
-    container_name: postiz-postgres
     restart: always
     environment:
       POSTGRES_PASSWORD: postiz-password
@@ -151,7 +147,6 @@ services:
       start_period: 10s
   postiz-redis:
     image: redis:7.2
-    container_name: postiz-redis
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -168,7 +163,6 @@ services:
   spotlight:
     profiles: [debug]
     pull_policy: always
-    container_name: spotlight
     restart: unless-stopped
     ports:
       - 127.0.0.1:8969:8969/tcp
@@ -180,7 +174,6 @@ services:
   # Temporal Stack
   # -----------------------
   temporal-elasticsearch:
-    container_name: temporal-elasticsearch
     image: elasticsearch:7.17.27
     restart: always
     environment:
@@ -205,7 +198,6 @@ services:
       - temporal-elasticsearch-data:/usr/share/elasticsearch/data
 
   temporal-postgresql:
-    container_name: temporal-postgresql
     image: postgres:16
     restart: always
     environment:
@@ -225,10 +217,7 @@ services:
       - temporal-postgres-data:/var/lib/postgresql/data
 
   temporal:
-    container_name: temporal
     restart: always
-    ports:
-      - '127.0.0.1:7233:7233'
     image: temporalio/auto-setup:1.28.1
     depends_on:
       temporal-postgresql:
@@ -260,7 +249,6 @@ services:
       kompose.volume.type: configMap
 
   temporal-admin-tools:
-    container_name: temporal-admin-tools
     image: temporalio/admin-tools:1.28.1-tctl-1.18.4-cli-1.4.1
     restart: on-failure
     environment:
@@ -275,7 +263,6 @@ services:
     tty: true
 
   temporal-ui:
-    container_name: temporal-ui
     image: temporalio/ui:2.34.0
     restart: always
     environment:
@@ -283,8 +270,6 @@ services:
       - TEMPORAL_CORS_ORIGINS=http://127.0.0.1:3000
     networks:
       - temporal-network
-    ports:
-      - '127.0.0.1:8080:8080'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s
