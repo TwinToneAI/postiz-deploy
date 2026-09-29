@@ -5,10 +5,10 @@ services:
     restart: always
     environment:
       # === Required Settings
-      MAIN_URL: 'http://localhost:4007'
-      FRONTEND_URL: 'http://localhost:4007'
-      NEXT_PUBLIC_BACKEND_URL: 'http://localhost:4007/api'
-      JWT_SECRET: 'random string that is unique to every install - just type random characters here!'
+      MAIN_URL: 'https://postiz.twintone.ai'
+      FRONTEND_URL: 'https://postiz.twintone.ai'
+      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.twintone.ai/api'
+      JWT_SECRET: 'pz-8f3a91c47e2d5b6084ac1e7f9d2b3456c7a8e90f1b2c3d4e5f60718293a4b5c'
       DATABASE_URL: 'postgresql://postiz-user:postiz-password@postiz-postgres:5432/postiz-db-local'
       REDIS_URL: 'redis://postiz-redis:6379'
       BACKEND_INTERNAL_URL: 'http://localhost:3000'
