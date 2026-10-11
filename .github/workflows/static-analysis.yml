@@ -1,0 +1,19 @@
+name: Static Analysis
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analysis:
+    # Org-wide reusable pipeline (TwinToneAI/.github). Advisory by default;
+    # flip `blocking: true` once the noise floor is acceptable for this repo.
+    uses: TwinToneAI/.github/.github/workflows/static-analysis.yml@main
+    with:
+      blocking: false
+    secrets: inherit
