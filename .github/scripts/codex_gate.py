@@ -13,7 +13,8 @@ Rules:
   needs a receipt comment or a submitted review that names the exact head.
   Evidence about other commits is ignored, so out-of-order completions cannot
   block or unblock the head.
-- An unreadable marker never counts as success, and is reported, not skipped.
+- A marker that does not parse, or has fields of the wrong type, never counts
+  as success, and is reported, not skipped.
 - Dependabot PRs pass: Codex does not review dependency bumps.
 """
 
@@ -27,104 +28,124 @@ import subprocess
 CODEX_BOT_ID = 199175422
 MARKER_RE = re.compile(r"codex-review-state:v1 (\{.*?\}) -->", re.S)
 RECEIPT_RE = re.compile(r"Reviewed commit:\**\s*`([0-9a-fA-F]{7,40})`")
+UNREADABLE = "Codex review state is unreadable: re-run after Codex updates it"
 
 
-def is_codex(user: dict | None) -> bool:
+def is_codex(user):
     user = user or {}
     return user.get("id") == CODEX_BOT_ID and user.get("type") == "Bot"
 
 
-def names_head(sha: str, head: str) -> bool:
-    return len(sha or "") >= 7 and head.lower().startswith(sha.lower())
+def names_head(sha, head):
+    if not isinstance(sha, str) or len(sha) < 7:
+        return False
+    return head.lower().startswith(sha.lower())
 
 
-def decide(pr: dict, comments: list, reviews: list) -> tuple[str, str, list]:
-    """Return (state, description, warnings) for the PR's head commit."""
-    head = pr["head"]["sha"]
-    short = head[:7]
-    warnings: list = []
-    if (pr.get("user") or {}).get("login") == "dependabot[bot]":
-        return (
-            "success",
-            "Dependabot PR: Codex does not review dependency bumps",
-            warnings,
-        )
+def when(item):
+    return item.get("updated_at") or item.get("created_at") or ""
 
-    markers, receipt_on_head = [], False
+
+def parse_marker(body):
+    """Return (review, problem). review is None when the marker is unusable."""
+    m = MARKER_RE.search(body)
+    if not m:
+        return None, "marker does not parse"
+    try:
+        data = json.loads(m.group(1))
+    except ValueError as e:
+        return None, f"marker is not JSON: {e}"
+    review = data.get("code_review") if isinstance(data, dict) else None
+    if not isinstance(review, dict):
+        return None, "marker has no code_review object"
+    status = review.get("status")
+    sha = review.get("commit_sha")
+    if not isinstance(status, str):
+        return None, "marker status is not a string"
+    if sha is not None and not isinstance(sha, str):
+        return None, "marker commit_sha is not a string"
+    return {"status": status, "commit_sha": sha or ""}, None
+
+
+def receipt_names_head(body, head):
+    r = RECEIPT_RE.search(body)
+    return bool(r) and names_head(r.group(1), head)
+
+
+def collect(comments, reviews, head):
+    """Return (markers, legacy_on_head, warnings) from Codex comments/reviews."""
+    markers = []
+    legacy = False
+    warnings = []
     for c in comments:
         if not is_codex(c.get("user")):
             continue
         body = c.get("body") or ""
-        m = MARKER_RE.search(body)
-        if not m and "codex-review-state" in body:
-            # A marker the parser cannot match must never fall through to the
-            # legacy receipt/review path: fail closed and say why.
-            warnings.append(
-                f"comment {c.get('id')}: codex-review-state marker does not parse"
-            )
-            markers.append((c.get("updated_at") or c.get("created_at") or "", None))
-            continue
-        if m:
-            try:
-                review = json.loads(m.group(1)).get("code_review") or {}
-            except ValueError as e:
-                warnings.append(
-                    f"comment {c.get('id')}: unreadable codex-review-state marker: {e}"
-                )
-                markers.append((c.get("updated_at") or c.get("created_at") or "", None))
-                continue
-            markers.append((c.get("updated_at") or c.get("created_at") or "", review))
+        if "codex-review-state" in body:
+            review, problem = parse_marker(body)
+            if problem:
+                warnings.append(f"comment {c.get('id')}: {problem}")
+            markers.append((when(c), review))
         elif "codex-review-receipt" in body:
-            r = RECEIPT_RE.search(body)
-            if r and names_head(r.group(1), head):
-                receipt_on_head = True
-    review_on_head = any(
-        is_codex(r.get("user")) and names_head(r.get("commit_id") or "", head)
-        for r in reviews
-    )
+            legacy = legacy or receipt_names_head(body, head)
+    for r in reviews:
+        if is_codex(r.get("user")) and names_head(r.get("commit_id"), head):
+            legacy = True
+    return markers, legacy, warnings
 
+
+def from_marker(review, head):
+    short = head[:7]
+    if review is None:
+        return "pending", UNREADABLE
+    status = review["status"]
+    sha = review["commit_sha"]
+    if names_head(sha, head) and status == "completed":
+        return "success", f"Codex reviewed {short}"
+    if names_head(sha, head):
+        return "pending", f"Codex review of {short} is {status}"
+    if sha:
+        hint = "comment @codex review"
+        return "pending", f"Codex last reviewed {sha[:7]}, not {short}: {hint}"
+    return "pending", "Waiting for Codex to review this PR"
+
+
+def decide(pr, comments, reviews):
+    """Return (state, description, warnings) for the PR's head commit."""
+    head = pr["head"]["sha"]
+    if (pr.get("user") or {}).get("login") == "dependabot[bot]":
+        return "success", "Dependabot PR: Codex skips dependency bumps", []
+    markers, legacy, warnings = collect(comments, reviews, head)
     if pr.get("draft"):
         return "pending", "Draft: Codex reviews it once marked ready", warnings
     if markers:
-        _, review = max(markers, key=lambda m: m[0])
-        if review is None:
-            return (
-                "pending",
-                "Codex review state is unreadable: re-run after Codex updates it",
-                warnings,
-            )
-        status, sha = review.get("status") or "none", review.get("commit_sha") or ""
-        if status == "completed" and names_head(sha, head):
-            return "success", f"Codex reviewed {short}", warnings
-        if names_head(sha, head):
-            return "pending", f"Codex review of {short} is {status}", warnings
-        if sha:
-            return (
-                "pending",
-                f"Codex last reviewed {sha[:7]}, not {short}: comment @codex review",
-                warnings,
-            )
-        return "pending", "Waiting for Codex to review this PR", warnings
-    if receipt_on_head or review_on_head:
-        return "success", f"Codex reviewed {short}", warnings
-    return "pending", f"Waiting for a Codex review of {short}", warnings
+        newest = max(markers, key=lambda m: m[0])[1]
+        state, desc = from_marker(newest, head)
+        return state, desc, warnings
+    if legacy:
+        return "success", f"Codex reviewed {head[:7]}", warnings
+    return "pending", f"Waiting for a Codex review of {head[:7]}", warnings
 
 
-def api(path: str):
-    out = subprocess.run(
-        ["gh", "api", "--paginate", "--slurp", path],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    pages = json.loads(out)
+def api(path):
+    args = ["gh", "api", "--paginate", "--slurp", path]
+    out = subprocess.run(args, check=True, capture_output=True, text=True)
+    pages = json.loads(out.stdout)
     if pages and isinstance(pages[0], list):
         return [item for page in pages for item in page]
     return pages[0]
 
 
-def main() -> int:
-    repo, number = os.environ["REPO"], os.environ["PR"]
+def post_status(repo, head, state, desc, url):
+    args = ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}"]
+    args += ["-f", f"state={state}", "-f", "context=codex-gate"]
+    args += ["-f", f"description={desc[:140]}", "-f", f"target_url={url}"]
+    subprocess.run(args, check=True, capture_output=True)
+
+
+def main():
+    repo = os.environ["REPO"]
+    number = os.environ["PR"]
     pr = api(f"repos/{repo}/pulls/{number}")
     if pr["state"] != "open":
         print(f"PR #{number} is {pr['state']}: nothing to do")
@@ -135,25 +156,7 @@ def main() -> int:
     for w in warnings:
         print(f"::warning::{w}")
     head = pr["head"]["sha"]
-    subprocess.run(
-        [
-            "gh",
-            "api",
-            "-X",
-            "POST",
-            f"repos/{repo}/statuses/{head}",
-            "-f",
-            f"state={state}",
-            "-f",
-            "context=codex-gate",
-            "-f",
-            f"description={desc[:140]}",
-            "-f",
-            f"target_url={pr['html_url']}",
-        ],
-        check=True,
-        capture_output=True,
-    )
+    post_status(repo, head, state, desc, pr["html_url"])
     print(f"{repo}#{number} {head[:7]}: {state} ({desc})")
     return 0
 
