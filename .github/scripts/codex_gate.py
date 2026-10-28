@@ -16,6 +16,7 @@ Rules:
 - An unreadable marker never counts as success, and is reported, not skipped.
 - Dependabot PRs pass: Codex does not review dependency bumps.
 """
+
 from __future__ import annotations
 
 import json
@@ -43,7 +44,11 @@ def decide(pr: dict, comments: list, reviews: list) -> tuple[str, str, list]:
     short = head[:7]
     warnings: list = []
     if (pr.get("user") or {}).get("login") == "dependabot[bot]":
-        return "success", "Dependabot PR: Codex does not review dependency bumps", warnings
+        return (
+            "success",
+            "Dependabot PR: Codex does not review dependency bumps",
+            warnings,
+        )
 
     markers, receipt_on_head = [], False
     for c in comments:
@@ -51,11 +56,21 @@ def decide(pr: dict, comments: list, reviews: list) -> tuple[str, str, list]:
             continue
         body = c.get("body") or ""
         m = MARKER_RE.search(body)
+        if not m and "codex-review-state" in body:
+            # A marker the parser cannot match must never fall through to the
+            # legacy receipt/review path: fail closed and say why.
+            warnings.append(
+                f"comment {c.get('id')}: codex-review-state marker does not parse"
+            )
+            markers.append((c.get("updated_at") or c.get("created_at") or "", None))
+            continue
         if m:
             try:
                 review = json.loads(m.group(1)).get("code_review") or {}
             except ValueError as e:
-                warnings.append(f"unreadable codex-review-state marker in comment {c.get('id')}: {e}")
+                warnings.append(
+                    f"comment {c.get('id')}: unreadable codex-review-state marker: {e}"
+                )
                 markers.append((c.get("updated_at") or c.get("created_at") or "", None))
                 continue
             markers.append((c.get("updated_at") or c.get("created_at") or "", review))
@@ -63,22 +78,32 @@ def decide(pr: dict, comments: list, reviews: list) -> tuple[str, str, list]:
             r = RECEIPT_RE.search(body)
             if r and names_head(r.group(1), head):
                 receipt_on_head = True
-    review_on_head = any(is_codex(r.get("user")) and names_head(r.get("commit_id") or "", head)
-                         for r in reviews)
+    review_on_head = any(
+        is_codex(r.get("user")) and names_head(r.get("commit_id") or "", head)
+        for r in reviews
+    )
 
     if pr.get("draft"):
         return "pending", "Draft: Codex reviews it once marked ready", warnings
     if markers:
         _, review = max(markers, key=lambda m: m[0])
         if review is None:
-            return "pending", "Codex review state is unreadable: re-run after Codex updates it", warnings
+            return (
+                "pending",
+                "Codex review state is unreadable: re-run after Codex updates it",
+                warnings,
+            )
         status, sha = review.get("status") or "none", review.get("commit_sha") or ""
         if status == "completed" and names_head(sha, head):
             return "success", f"Codex reviewed {short}", warnings
         if names_head(sha, head):
             return "pending", f"Codex review of {short} is {status}", warnings
         if sha:
-            return "pending", f"Codex last reviewed {sha[:7]}, not {short}: comment @codex review", warnings
+            return (
+                "pending",
+                f"Codex last reviewed {sha[:7]}, not {short}: comment @codex review",
+                warnings,
+            )
         return "pending", "Waiting for Codex to review this PR", warnings
     if receipt_on_head or review_on_head:
         return "success", f"Codex reviewed {short}", warnings
@@ -86,8 +111,12 @@ def decide(pr: dict, comments: list, reviews: list) -> tuple[str, str, list]:
 
 
 def api(path: str):
-    out = subprocess.run(["gh", "api", "--paginate", "--slurp", path], check=True,
-                         capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["gh", "api", "--paginate", "--slurp", path],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
     pages = json.loads(out)
     if pages and isinstance(pages[0], list):
         return [item for page in pages for item in page]
@@ -106,10 +135,25 @@ def main() -> int:
     for w in warnings:
         print(f"::warning::{w}")
     head = pr["head"]["sha"]
-    subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
-                    "-f", f"state={state}", "-f", "context=codex-gate",
-                    "-f", f"description={desc[:140]}", "-f", f"target_url={pr['html_url']}"],
-                   check=True, capture_output=True)
+    subprocess.run(
+        [
+            "gh",
+            "api",
+            "-X",
+            "POST",
+            f"repos/{repo}/statuses/{head}",
+            "-f",
+            f"state={state}",
+            "-f",
+            "context=codex-gate",
+            "-f",
+            f"description={desc[:140]}",
+            "-f",
+            f"target_url={pr['html_url']}",
+        ],
+        check=True,
+        capture_output=True,
+    )
     print(f"{repo}#{number} {head[:7]}: {state} ({desc})")
     return 0
 
