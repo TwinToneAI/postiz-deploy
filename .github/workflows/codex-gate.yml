@@ -1,0 +1,84 @@
+# Codex review gate (TWI2-2681).
+# Sets the commit status `codex-gate` on a PR's head commit. It is success only
+# when the Codex connector has finished a review of exactly that commit (or the
+# PR is from Dependabot, which Codex does not review). The repo ruleset requires
+# it, plus resolved conversations, before merge. Logic and its rules:
+# .github/scripts/codex_gate.py; tests: .github/scripts/test_codex_gate.py.
+#
+# The `gate` job runs on pull_request_target / issue_comment, which use the
+# default branch's copy of this file and script; it never checks out PR code,
+# so its token (statuses: write) is safe, and Dependabot PRs get one too.
+# No pull_request_review trigger: on fork PRs that event gets a read-only token.
+# Codex always creates or edits a comment when it finishes, and issue_comment
+# runs with the base repo's token.
+# The `test` job runs the gate's unit tests on PRs that change them.
+name: codex-gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+  pull_request:
+    paths:
+      - .github/scripts/codex_gate.py
+      - .github/scripts/test_codex_gate.py
+      - .github/workflows/codex-gate.yml
+  # Backfill: set the status on a PR opened before this workflow existed.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number
+        required: true
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  gate:
+    # Only Codex connector comments (account id 199175422) matter. Other comments
+    # skip the job before it joins the concurrency group, so they cannot replace
+    # a queued Codex-triggered run.
+    if: >-
+      github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.comment.user.id == 199175422)
+    concurrency:
+      group: codex-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out the gate script from the default branch (never PR code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Set codex-gate status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+        run: |
+          if [ ! -f .github/scripts/codex_gate.py ]; then
+            echo "::notice::codex_gate.py is not on the default branch yet (this PR installs it); status not set"
+            exit 0
+          fi
+          python3 .github/scripts/codex_gate.py
+
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests for the gate logic
+        run: python3 -m unittest discover -s .github/scripts -p 'test_codex_gate.py' -v
