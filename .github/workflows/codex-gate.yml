@@ -1,13 +1,17 @@
-# Codex review gate (TWI2-2680).
-# Sets the commit status `codex-gate` on a PR's head commit:
-#   success  Codex finished a review of exactly this commit (or a Dependabot PR,
-#            which Codex does not review)
-#   pending  anything else; the repo ruleset requires success before merge
-# Only comments and reviews by the Codex connector app (account id 199175422)
-# count. Unresolved Codex threads are blocked separately by the ruleset's
-# "require conversation resolution" rule.
-# It never checks out PR code, so pull_request_target is safe here and gives
-# Dependabot PRs a token that can write statuses.
+# Codex review gate (TWI2-2681).
+# Sets the commit status `codex-gate` on a PR's head commit. It is success only
+# when the Codex connector has finished a review of exactly that commit (or the
+# PR is from Dependabot, which Codex does not review). The repo ruleset requires
+# it, plus resolved conversations, before merge. Logic and its rules:
+# .github/scripts/codex_gate.py; tests: .github/scripts/test_codex_gate.py.
+#
+# The `gate` job runs on pull_request_target / issue_comment, which use the
+# default branch's copy of this file and script; it never checks out PR code,
+# so its token (statuses: write) is safe, and Dependabot PRs get one too.
+# No pull_request_review trigger: on fork PRs that event gets a read-only token.
+# Codex always creates or edits a comment when it finishes, and issue_comment
+# runs with the base repo's token.
+# The `test` job runs the gate's unit tests on PRs that change them.
 name: codex-gate
 
 on:
@@ -15,9 +19,11 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
     types: [created, edited]
-  # No pull_request_review trigger: on fork PRs that event gets a read-only token,
-  # so it could never write the status. Codex always also creates or edits its
-  # summary/receipt comment, and issue_comment runs with the base repo's token.
+  pull_request:
+    paths:
+      - .github/scripts/codex_gate.py
+      - .github/scripts/test_codex_gate.py
+      - .github/workflows/codex-gate.yml
   # Backfill: set the status on a PR opened before this workflow existed.
   workflow_dispatch:
     inputs:
@@ -26,103 +32,53 @@ on:
         required: true
 
 permissions:
+  contents: read
   statuses: write
   pull-requests: read
   issues: read
 
-concurrency:
-  group: codex-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: false
-
 jobs:
   gate:
-    # Comments only matter when the Codex connector app wrote them (matched by its
-    # numeric account id, which nobody else can take); everything else is skipped
-    # (skipped jobs use no Actions minutes).
+    # Only Codex connector comments (account id 199175422) matter. Other comments
+    # skip the job before it joins the concurrency group, so they cannot replace
+    # a queued Codex-triggered run.
     if: >-
       github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        github.event.comment.user.id == 199175422)
+    concurrency:
+      group: codex-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      - name: Check out the gate script from the default branch (never PR code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
       - name: Set codex-gate status
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
         run: |
-          python3 - <<'PY'
-          import json, os, re, subprocess
+          if [ ! -f .github/scripts/codex_gate.py ]; then
+            echo "::notice::codex_gate.py is not on the default branch yet (this PR installs it); status not set"
+            exit 0
+          fi
+          python3 .github/scripts/codex_gate.py
 
-          repo, pr = os.environ["REPO"], os.environ["PR"]
-
-          def api(path):
-              out = subprocess.run(["gh", "api", "--paginate", "--slurp", path], check=True,
-                                   capture_output=True, text=True).stdout
-              pages = json.loads(out)
-              if pages and isinstance(pages[0], list):
-                  return [item for page in pages for item in page]
-              return pages[0]
-
-          p = api(f"repos/{repo}/pulls/{pr}")
-          head = p["head"]["sha"]
-          if p["state"] != "open":
-              print(f"PR #{pr} is {p['state']}: nothing to do")
-              raise SystemExit(0)
-
-          # chatgpt-codex-connector[bot]. Match the account id and type, never a
-          # login substring: any user can pick a login containing "codex".
-          CODEX_BOT_ID = 199175422
-
-          def is_codex(user):
-              user = user or {}
-              return user.get("id") == CODEX_BOT_ID and user.get("type") == "Bot"
-
-          marker_re = re.compile(r"codex-review-state:v1 (\{.*?\}) -->", re.S)
-          receipt_re = re.compile(r"Reviewed commit:\**\s*`([0-9a-fA-F]{7,40})`")
-          signals = []
-          for c in api(f"repos/{repo}/issues/{pr}/comments?per_page=100"):
-              if not is_codex(c.get("user")):
-                  continue
-              body = c.get("body") or ""
-              m = marker_re.search(body)
-              if m:
-                  try:
-                      cr = json.loads(m.group(1)).get("code_review") or {}
-                  except ValueError:
-                      continue
-                  signals.append((c.get("updated_at") or "", 2, cr.get("status") or "none", cr.get("commit_sha") or ""))
-              elif "codex-review-receipt" in body:
-                  r = receipt_re.search(body)
-                  if r:
-                      signals.append((c.get("created_at") or "", 1, "completed", r.group(1)))
-          for r in api(f"repos/{repo}/pulls/{pr}/reviews?per_page=100"):
-              if is_codex(r.get("user")) and r.get("commit_id"):
-                  signals.append((r.get("submitted_at") or "", 0, "completed", r["commit_id"]))
-
-          status, sha = ("none", "")
-          if signals:
-              _, _, status, sha = max(signals, key=lambda s: (s[0], s[1]))
-          on_head = len(sha) >= 7 and head.lower().startswith(sha.lower())
-
-          if (p["user"] or {}).get("login") == "dependabot[bot]":
-              state, desc = "success", "Dependabot PR: Codex does not review dependency bumps"
-          elif status == "completed" and on_head:
-              state, desc = "success", f"Codex reviewed {head[:7]}"
-          elif p.get("draft"):
-              state, desc = "pending", "Draft: Codex reviews it once marked ready"
-          elif status == "running" and on_head:
-              state, desc = "pending", f"Codex is reviewing {head[:7]}"
-          elif sha:
-              state, desc = "pending", f"Codex reviewed {sha[:7]}, not {head[:7]}: comment @codex review"
-          else:
-              state, desc = "pending", "Waiting for Codex to review this PR"
-
-          subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
-                          "-f", f"state={state}", "-f", "context=codex-gate",
-                          "-f", f"description={desc[:140]}",
-                          "-f", f"target_url={p['html_url']}"],
-                         check=True, capture_output=True)
-          print(f"{repo}#{pr} {head[:7]}: {state} ({desc})")
-          PY
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests for the gate logic
+        run: python3 -m unittest discover -s .github/scripts -p 'test_codex_gate.py' -v
