@@ -7,7 +7,7 @@ Every branch, commit, and PR references its Linear ticket.
 - Branch: `james/<TICKET-ID>-<slug>`
 - PR title must contain `<TICKET-ID>`: `type(scope): TICKET-ID summary` (squash-merge turns the title into the commit message on `main`).
 - PR body must contain `Closes <TICKET-ID>` (Linear auto-transitions on merge).
-Accepted prefixes: `TWI2`, `VEN`, `SAL`, `MAR`, `CONSULT`, `RES`. Never reuse an unrelated ID to satisfy the format.
+Accepted prefixes: `TWI2`, `SAL` (active TwinTone workspace teams; consulting and venture tickets belong to their own workspace). Never reuse an unrelated ID to satisfy the format.
 
 ## Concurrency: one agent, one worktree
 Several agents work this org. Work in your own git worktree + branch; never edit the primary checkout; never commit on another agent's branch. Stage by explicit path (`git add <path>`), never `git add -A`.
